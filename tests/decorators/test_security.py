@@ -1,3 +1,4 @@
+import asyncio
 import json
 from unittest.mock import MagicMock, patch
 
@@ -407,3 +408,230 @@ async def test_optional_kwargs_injected():
         apikey_info_kwargs, "header", "X-Auth", None
     )
     assert await wrapped_func_kwargs(request) == {"sub": "kwargs"}
+
+
+def _apikey_schemes(token_info_key1, token_info_key2):
+    """Build two apikey verify funcs, keyed by scheme name, returning the provided
+    token infos for valid keys."""
+
+    def apikey1_info(apikey, required_scopes=None):
+        if apikey == "foobar":
+            return token_info_key1
+        return None
+
+    def apikey2_info(apikey, required_scopes=None):
+        if apikey == "bar":
+            return token_info_key2
+        return None
+
+    apikey_security_handler = ApiKeySecurityHandler()
+    return {
+        "key1": apikey_security_handler._get_verify_func(
+            apikey1_info, "header", "X-Auth-1", []
+        ),
+        "key2": apikey_security_handler._get_verify_func(
+            apikey2_info, "header", "X-Auth-2", []
+        ),
+    }
+
+
+def _both_keys_request():
+    """Request with valid credentials for both apikey schemes."""
+    return ConnexionRequest(
+        scope={
+            "type": "http",
+            "headers": [[b"x-auth-1", b"foobar"], [b"x-auth-2", b"bar"]],
+        }
+    )
+
+
+def test_security_handler_factory_default_identity_aggregator():
+    """The identity aggregator is optional and defaults to None."""
+    assert SecurityHandlerFactory().identity_aggregator is None
+
+
+async def test_multiple_schemes_identity_aggregator():
+    """The identity aggregator receives the verification results keyed by scheme
+    name and its return value becomes the token_info."""
+    received = {}
+
+    def aggregator(token_infos):
+        received.update(token_infos)
+        subs = {token_info["sub"] for token_info in token_infos.values()}
+        if len(subs) != 1:
+            raise OAuthProblem(detail="Schemes do not belong to the same subject")
+        return {"sub": subs.pop()}
+
+    security_handler_factory = SecurityHandlerFactory(identity_aggregator=aggregator)
+    schemes = _apikey_schemes({"sub": "foo"}, {"sub": "foo"})
+    wrapped_func = security_handler_factory.verify_multiple_schemes(schemes)
+
+    assert await wrapped_func(_both_keys_request()) == {"sub": "foo"}
+    assert received == {"key1": {"sub": "foo"}, "key2": {"sub": "foo"}}
+
+
+async def test_multiple_schemes_identity_aggregator_async():
+    """The identity aggregator can be a coroutine function, and can be passed
+    directly to verify_multiple_schemes."""
+
+    async def aggregator(token_infos):
+        return {"sub": token_infos["key1"]["sub"]}
+
+    security_handler_factory = SecurityHandlerFactory()
+    schemes = _apikey_schemes({"sub": "foo"}, {"sub": "foo"})
+    wrapped_func = security_handler_factory.verify_multiple_schemes(
+        schemes, identity_aggregator=aggregator
+    )
+
+    assert await wrapped_func(_both_keys_request()) == {"sub": "foo"}
+
+
+async def test_multiple_schemes_identity_aggregator_subject_mismatch():
+    """A request for which both schemes verify successfully, but resolve to
+    different subjects, is rejected by the aggregator."""
+
+    def aggregator(token_infos):
+        subs = {token_info["sub"] for token_info in token_infos.values()}
+        if len(subs) != 1:
+            raise OAuthProblem(detail="Schemes do not belong to the same subject")
+        return {"sub": subs.pop()}
+
+    security_handler_factory = SecurityHandlerFactory(identity_aggregator=aggregator)
+    schemes = _apikey_schemes({"sub": "foo"}, {"sub": "bar"})
+
+    # Both schemes verify successfully on their own
+    request = _both_keys_request()
+    assert await schemes["key1"](request) == {"sub": "foo"}
+    assert await schemes["key2"](request) == {"sub": "bar"}
+
+    # But the AND combination is rejected
+    verify_func = security_handler_factory.verify_security(
+        [security_handler_factory.verify_multiple_schemes(schemes)]
+    )
+    with pytest.raises(OAuthProblem) as exc_info:
+        await verify_func(request)
+
+    assert exc_info.value.status_code == 401
+    assert exc_info.value.detail == "Schemes do not belong to the same subject"
+    # The rejected request does not pollute the context
+    assert "user" not in request.context
+    assert "token_info" not in request.context
+
+
+async def test_multiple_schemes_identity_aggregator_returns_none():
+    """An identity aggregator returning None rejects the request."""
+    security_handler_factory = SecurityHandlerFactory(
+        identity_aggregator=lambda token_infos: None
+    )
+    schemes = _apikey_schemes({"sub": "foo"}, {"sub": "foo"})
+    wrapped_func = security_handler_factory.verify_multiple_schemes(schemes)
+
+    with pytest.raises(OAuthResponseProblem) as exc_info:
+        await wrapped_func(_both_keys_request())
+
+    assert exc_info.value.status_code == 401
+
+
+async def test_multiple_schemes_identity_aggregator_anonymous_scheme():
+    """If a scheme in the AND combination does not find credentials, the
+    combination evaluates to NO_VALUE and the aggregator is not called."""
+    aggregator = MagicMock(return_value={"sub": "foo"})
+    security_handler_factory = SecurityHandlerFactory(identity_aggregator=aggregator)
+    schemes = _apikey_schemes({"sub": "foo"}, {"sub": "foo"})
+    wrapped_func = security_handler_factory.verify_multiple_schemes(schemes)
+
+    request = ConnexionRequest(
+        scope={"type": "http", "headers": [[b"x-auth-1", b"foobar"]]}
+    )
+    assert await wrapped_func(request) is NO_VALUE
+    aggregator.assert_not_called()
+
+
+async def test_multiple_schemes_identity_aggregator_cancelled():
+    """Cancellation of the identity aggregator is not swallowed."""
+
+    async def aggregator(token_infos):
+        raise asyncio.CancelledError
+
+    security_handler_factory = SecurityHandlerFactory(identity_aggregator=aggregator)
+    schemes = _apikey_schemes({"sub": "foo"}, {"sub": "foo"})
+    wrapped_func = security_handler_factory.verify_multiple_schemes(schemes)
+
+    with pytest.raises(asyncio.CancelledError):
+        await wrapped_func(_both_keys_request())
+
+
+async def test_verify_security_only_successful_branch_commits_context():
+    """In an OR combination, only the token_info of the branch that actually
+    succeeds is committed to the context."""
+
+    async def failing_branch(request):
+        raise OAuthProblem(detail="Provided credentials are not valid")
+
+    async def successful_branch(request):
+        return {"sub": "foo"}
+
+    security_handler_factory = SecurityHandlerFactory()
+    verify_func = security_handler_factory.verify_security(
+        [failing_branch, successful_branch]
+    )
+
+    request = ConnexionRequest(scope={"type": "http", "headers": []})
+    await verify_func(request)
+
+    assert request.context["user"] == "foo"
+    assert request.context["token_info"] == {"sub": "foo"}
+
+
+async def test_verify_security_all_branches_fail_context_untouched():
+    """If all branches of an OR combination fail, the context is not updated."""
+
+    async def failing_branch(request):
+        raise OAuthProblem(detail="Provided credentials are not valid")
+
+    security_handler_factory = SecurityHandlerFactory()
+    verify_func = security_handler_factory.verify_security(
+        [failing_branch, failing_branch]
+    )
+
+    request = ConnexionRequest(scope={"type": "http", "headers": []})
+    with pytest.raises(OAuthProblem):
+        await verify_func(request)
+
+    assert "user" not in request.context
+    assert "token_info" not in request.context
+
+
+async def test_verify_security_anonymous_branch():
+    """An anonymous branch (empty security requirement) yields an empty
+    token_info."""
+    security_handler_factory = SecurityHandlerFactory()
+    verify_func = security_handler_factory.verify_security(
+        [security_handler_factory.verify_none]
+    )
+
+    request = ConnexionRequest(scope={"type": "http", "headers": []})
+    await verify_func(request)
+
+    assert request.context["user"] is None
+    assert request.context["token_info"] == {}
+
+
+async def test_verify_security_cancelled_branch_propagates():
+    """Cancellation of a branch is not treated as a failed branch in the OR
+    combination, but propagates instead."""
+
+    async def cancelled_branch(request):
+        raise asyncio.CancelledError
+
+    async def successful_branch(request):
+        return {"sub": "foo"}
+
+    security_handler_factory = SecurityHandlerFactory()
+    verify_func = security_handler_factory.verify_security(
+        [cancelled_branch, successful_branch]
+    )
+
+    request = ConnexionRequest(scope={"type": "http", "headers": []})
+    with pytest.raises(asyncio.CancelledError):
+        await verify_func(request)

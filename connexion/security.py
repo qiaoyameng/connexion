@@ -450,15 +450,23 @@ class SecurityHandlerFactory:
     By default, it will use the built-in security handlers specified in the
     SECURITY_HANDLERS dict, but you can also pass in your own security handlers
     to override the built-in ones.
+
+    An optional ``identity_aggregator`` can be provided, which is used by default
+    for security requirements that combine multiple schemes in AND fashion. It
+    receives the verification results of the individual schemes, mapped by scheme
+    name, and should return a single unified identity or reject the request by
+    raising an exception or returning ``None``. It can be a coroutine function.
     """
 
     def __init__(
         self,
         security_handlers: t.Optional[dict] = None,
+        identity_aggregator: t.Optional[t.Callable] = None,
     ) -> None:
         self.security_handlers = SECURITY_HANDLERS.copy()
         if security_handlers is not None:
             self.security_handlers.update(security_handlers)
+        self.identity_aggregator = identity_aggregator
 
     def parse_security_scheme(
         self,
@@ -549,15 +557,27 @@ class SecurityHandlerFactory:
         """
         return {}
 
-    def verify_multiple_schemes(self, schemes):
+    def verify_multiple_schemes(self, schemes, identity_aggregator=None):
         """
         Verifies multiple authentication schemes in AND fashion.
         If any scheme fails, the entire authentication fails.
 
         :param schemes: mapping scheme_name to auth function
         :type schemes: dict
+        :param identity_aggregator: Optional callable to aggregate the verification
+            results of the individual schemes into a single identity. It receives a
+            dictionary mapping the scheme names to their verification results, and
+            should return the unified identity or reject the request by raising an
+            exception or returning ``None``. It can be a coroutine function.
+            Defaults to the ``identity_aggregator`` configured on the factory.
+        :type identity_aggregator: t.Optional[t.Callable]
         :rtype: types.FunctionType
         """
+        aggregator = (
+            identity_aggregator
+            if identity_aggregator is not None
+            else self.identity_aggregator
+        )
 
         async def wrapper(request):
             token_info = {}
@@ -566,10 +586,22 @@ class SecurityHandlerFactory:
                 while asyncio.iscoroutine(result):
                     result = await result
                 if result is NO_VALUE:
+                    # A scheme without credentials (anonymous for that scheme)
+                    # fails the whole AND combination.
                     return NO_VALUE
                 token_info[scheme_name] = result
 
-            return token_info
+            if aggregator is None:
+                return token_info
+
+            identity = aggregator(token_info)
+            while asyncio.iscoroutine(identity):
+                identity = await identity
+            if identity is None:
+                raise OAuthResponseProblem(
+                    detail="Identity aggregator rejected the provided credentials"
+                )
+            return identity
 
         return wrapper
 
@@ -585,6 +617,10 @@ class SecurityHandlerFactory:
                         token_info = await token_info
                     if token_info is not NO_VALUE:
                         break
+                except asyncio.CancelledError:
+                    # Cancellation should not be treated as a failed branch in
+                    # the OR combination.
+                    raise
                 except Exception as err:
                     errors.append(err)
 
@@ -595,6 +631,8 @@ class SecurityHandlerFactory:
                     logger.info("... No auth provided. Aborting with 401.")
                     raise OAuthProblem(detail="No authorization token provided")
 
+            # Only the token_info of the branch that actually succeeded is
+            # committed to the context, so failed branches cannot pollute it.
             request.context.update(
                 {
                     # Fallback to 'uid' for backward compatibility

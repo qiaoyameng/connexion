@@ -117,11 +117,14 @@ class SecurityAPI(RoutedAPI[SecurityOperation]):
         *args,
         auth_all_paths: bool = False,
         security_map: t.Optional[dict] = None,
+        identity_aggregator: t.Optional[t.Callable] = None,
         **kwargs,
     ):
         super().__init__(*args, **kwargs)
 
-        self.security_handler_factory = SecurityHandlerFactory(security_map)
+        self.security_handler_factory = SecurityHandlerFactory(
+            security_map, identity_aggregator=identity_aggregator
+        )
 
         if auth_all_paths:
             self.add_auth_on_not_found()

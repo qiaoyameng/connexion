@@ -164,6 +164,44 @@ corresponding ``token_info``.
 
 Multiple OAuth2 security schemes in AND fashion are not supported.
 
+Identity aggregation
+^^^^^^^^^^^^^^^^^^^^
+
+When multiple authentication schemes are combined using logical AND, you can
+optionally configure an identity aggregator to merge the verification results
+of the individual schemes into a single identity. This is useful when an
+endpoint requires multiple credentials (for example an API key and an OAuth
+token) and you want to make sure they belong to the same subject.
+
+The aggregator receives a dictionary mapping the security scheme names to
+their verification results, and should return the unified identity, which
+becomes the ``token_info`` for the request. It can reject the request by
+raising an exception (for example an ``OAuthProblem``) or by returning
+``None``. The aggregator can be a coroutine function.
+
+The aggregator can be configured on the ``SecurityHandlerFactory``, or passed
+to ``verify_multiple_schemes`` directly:
+
+.. code-block:: python
+
+    from connexion.security import SecurityHandlerFactory
+
+
+    def aggregate_identities(token_infos):
+        subjects = {token_info["sub"] for token_info in token_infos.values()}
+        if len(subjects) != 1:
+            raise OAuthProblem(detail="Schemes do not belong to the same subject")
+        return {"sub": subjects.pop()}
+
+
+    security_handler_factory = SecurityHandlerFactory(
+        identity_aggregator=aggregate_identities
+    )
+
+If no identity aggregator is configured, the behavior is unchanged: the
+``token_info`` consists of a dictionary mapping the security scheme names to
+their corresponding ``token_info``.
+
 .. _OpenAPI specification: https://swagger.io/docs/specification/authentication/#multiple
 
 Custom security handlers
