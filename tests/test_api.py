@@ -168,6 +168,17 @@ def test_invalid_schema_file_structure():
         )
 
 
+def test_invalid_content_parameter_definition():
+    # A parameter cannot define `content` together with `schema`/`style`/`explode`
+    with pytest.raises(InvalidSpecification):
+        FlaskApi(
+            Specification.load(
+                TEST_FOLDER / "fixtures/invalid_content_param/openapi.yaml"
+            ),
+            base_path="/api/v1.0",
+        )
+
+
 def test_invalid_encoding():
     with tempfile.NamedTemporaryFile(mode="wb", delete=False) as f:
         f.write(

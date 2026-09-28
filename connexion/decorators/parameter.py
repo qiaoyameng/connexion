@@ -255,6 +255,10 @@ def _get_path_arguments(
 
 def _get_val_from_param(value: t.Any, param_definitions: t.Dict[str, dict]) -> t.Any:
     """Cast a value according to its definition in the specification."""
+    if "content" in param_definitions:
+        # Parameters defined via `content` are already deserialized by the uri parser
+        return value
+
     param_schema = param_definitions.get("schema", param_definitions)
 
     if is_nullable(param_schema) and is_null(value):

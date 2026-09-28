@@ -39,6 +39,112 @@ def test_required_query_param(simple_app):
     assert response.status_code == 200
 
 
+def test_content_query_param(simple_openapi_app):
+    app_client = simple_openapi_app.test_client()
+
+    url = "/v1.0/test-content-query-param"
+    # Commas and nested arrays must survive: the value is decoded as JSON based on
+    # the content media type instead of being split based on style.
+    payload = {"name": "comma,value", "tags": [[1, 2], [3]]}
+    response = app_client.get(url, params={"filter": json.dumps(payload)})
+    assert response.status_code == 200
+    assert response.json() == payload
+
+
+def test_content_query_param_percent_decoded_once(simple_openapi_app):
+    app_client = simple_openapi_app.test_client()
+
+    # %252C decodes to the literal string "%2C" exactly once. If the value were
+    # percent-decoded again, the result would be a comma instead.
+    url = "/v1.0/test-content-query-param?filter=%7B%22name%22%3A%22a%252Cb%22%7D"
+    response = app_client.get(url)
+    assert response.status_code == 200
+    assert response.json() == {"name": "a%2Cb"}
+
+
+def test_content_query_param_duplicates(simple_openapi_app):
+    app_client = simple_openapi_app.test_client()
+
+    url = "/v1.0/test-content-query-param"
+    params = [
+        ("filter", json.dumps({"name": "first"})),
+        ("filter", json.dumps({"name": "last"})),
+    ]
+    response = app_client.get(url, params=params)
+    assert response.status_code == 200
+    # Deterministic behavior: the last occurrence wins
+    assert response.json() == {"name": "last"}
+
+
+def test_content_query_param_empty(simple_openapi_app):
+    app_client = simple_openapi_app.test_client()
+
+    url = "/v1.0/test-content-query-param"
+    # An empty value is treated as missing, and the parameter is required
+    response = app_client.get(url, params={"filter": ""})
+    assert response.status_code == 400
+
+    response = app_client.get(url)
+    assert response.status_code == 400
+
+
+def test_content_query_param_invalid(simple_openapi_app):
+    app_client = simple_openapi_app.test_client()
+
+    url = "/v1.0/test-content-query-param"
+    # Invalid JSON
+    response = app_client.get(url, params={"filter": "{not json"})
+    assert response.status_code == 400
+
+    # Valid JSON, but not valid against the content schema
+    response = app_client.get(url, params={"filter": json.dumps({"tags": [[1]]})})
+    assert response.status_code == 400
+
+    response = app_client.get(url, params={"filter": json.dumps({"name": 1})})
+    assert response.status_code == 400
+
+
+def test_content_header_param(simple_openapi_app):
+    app_client = simple_openapi_app.test_client()
+
+    url = "/v1.0/test-content-header-param"
+    headers = {"x-filter": json.dumps({"name": "comma,value"})}
+    response = app_client.get(url, headers=headers)
+    assert response.status_code == 200
+
+    response = app_client.get(url, headers={"x-filter": "{not json"})
+    assert response.status_code == 400
+
+    response = app_client.get(url, headers={"x-filter": json.dumps({"name": 1})})
+    assert response.status_code == 400
+
+    response = app_client.get(url)
+    assert response.status_code == 400
+
+
+def test_content_cookie_param(simple_openapi_app):
+    app_client = simple_openapi_app.test_client(
+        cookies={"filter": json.dumps({"name": "comma,value"})}
+    )
+
+    response = app_client.get("/v1.0/test-content-cookie-param")
+    assert response.status_code == 200
+
+    app_client = simple_openapi_app.test_client(cookies={"filter": "{not json"})
+    response = app_client.get("/v1.0/test-content-cookie-param")
+    assert response.status_code == 400
+
+    app_client = simple_openapi_app.test_client(
+        cookies={"filter": json.dumps({"name": 1})}
+    )
+    response = app_client.get("/v1.0/test-content-cookie-param")
+    assert response.status_code == 400
+
+    app_client = simple_openapi_app.test_client()
+    response = app_client.get("/v1.0/test-content-cookie-param")
+    assert response.status_code == 400
+
+
 def test_array_query_param(simple_app):
     app_client = simple_app.test_client()
     headers = {"Content-type": "application/json"}

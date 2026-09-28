@@ -7,6 +7,7 @@ import typing as t
 from http import HTTPStatus
 
 from connexion.datastructures import MediaTypeDict, NoContent
+from connexion.exceptions import InvalidSpecification
 from connexion.operations.abstract import AbstractOperation
 from connexion.uri_parsing import OpenAPIURIParser
 from connexion.utils import build_example_from_schema, deep_get
@@ -86,6 +87,9 @@ class OpenAPIOperation(AbstractOperation):
         if path_parameters:
             self._parameters += path_parameters
 
+        for param in self._parameters:
+            self._validate_content_parameter(param)
+
         self._responses = operation.get("responses", {})
 
         # TODO figure out how to support multiple mimetypes
@@ -122,6 +126,28 @@ class OpenAPIOperation(AbstractOperation):
     @property
     def parameters(self):
         return self._parameters
+
+    @staticmethod
+    def _validate_content_parameter(param):
+        """Parameters defined via `content` cannot be combined with `schema`,
+        `style` or `explode`, and must define exactly one media type."""
+        if "content" not in param:
+            return
+        if any(key in param for key in ("schema", "style", "explode")):
+            raise InvalidSpecification(
+                "Parameter '{name}' ({location}) defines 'content' together with "
+                "'schema', 'style' or 'explode', which is not allowed by the "
+                "OpenAPI specification.".format(
+                    name=param.get("name"), location=param.get("in")
+                )
+            )
+        if len(param["content"]) != 1:
+            raise InvalidSpecification(
+                "Parameter '{name}' ({location}) must define exactly one media type "
+                "in 'content'.".format(
+                    name=param.get("name"), location=param.get("in")
+                )
+            )
 
     @property
     def consumes(self):

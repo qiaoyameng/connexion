@@ -9,7 +9,7 @@ import logging
 import re
 
 from connexion.exceptions import TypeValidationError
-from connexion.utils import all_json, coerce_type, deep_merge
+from connexion.utils import all_json, coerce_type, decode_content_parameter, deep_merge
 
 logger = logging.getLogger("connexion.decorators.uri_parsing")
 
@@ -111,6 +111,12 @@ class AbstractURIParser(metaclass=abc.ABCMeta):
                 # multiple values in a path is impossible
                 values = [values]
 
+            if param_defn and "content" in param_defn:
+                # Parameters defined via `content` are deserialized based on the
+                # media type instead of being split based on `style`.
+                resolved_param[k] = self._resolve_content_param(values, param_defn)
+                continue
+
             if param_schema and param_schema["type"] == "array":
                 # resolve variable re-assignment, handle explode
                 values = self._resolve_param_duplicates(values, param_defn, _in)
@@ -127,6 +133,20 @@ class AbstractURIParser(metaclass=abc.ABCMeta):
                 pass
 
         return resolved_param
+
+    @staticmethod
+    def _resolve_content_param(values, param_defn):
+        """Resolve a parameter defined via `content`. The last occurrence is used
+        if the parameter is provided multiple times. Empty values are treated as
+        missing. Values that fail to decode are passed on raw, so validation can
+        reject them."""
+        value = values[-1]
+        if value == "":
+            return None
+        try:
+            return decode_content_parameter(value, param_defn)
+        except ValueError:
+            return value
 
 
 class OpenAPIURIParser(AbstractURIParser):

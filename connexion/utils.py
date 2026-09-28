@@ -6,6 +6,7 @@ import asyncio
 import functools
 import importlib
 import inspect
+import json
 import os
 import sys
 import typing
@@ -205,6 +206,23 @@ def is_null(value):
         return True
 
     return False
+
+
+def content_parameter_schema(param_def: dict) -> dict:
+    """Return the schema of a parameter defined via `content`. The content map is
+    guaranteed to hold exactly one entry, as enforced when the spec is loaded."""
+    media_type_def = next(iter(param_def["content"].values()))
+    return media_type_def.get("schema", {})
+
+
+def decode_content_parameter(value: str, param_def: dict) -> t.Any:
+    """Decode the raw value of a parameter defined via `content` based on the media
+    type of its content definition. The value is expected to be percent-decoded
+    already, and is decoded exactly once here."""
+    media_type = next(iter(param_def["content"]))
+    if all_json([media_type]):
+        return json.loads(value)
+    return value
 
 
 def has_coroutine(function, api=None):

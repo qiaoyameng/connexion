@@ -406,6 +406,18 @@ def test_cookie_param():
     return {"cookie_value": request.cookies["test_cookie"]}
 
 
+def test_content_query_param(filter):
+    return filter
+
+
+def test_content_header_param():
+    return ""
+
+
+def test_content_cookie_param():
+    return ""
+
+
 def test_exploded_deep_object_param(id):
     return id
 

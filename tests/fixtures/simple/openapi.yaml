@@ -735,6 +735,72 @@ paths:
       responses:
         '200':
           description: OK
+  /test-content-query-param:
+    get:
+      summary: Test query parameter defined via content.
+      operationId: fakeapi.hello.test_content_query_param
+      parameters:
+        - name: filter
+          in: query
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                  tags:
+                    type: array
+                    items:
+                      type: array
+                      items:
+                        type: integer
+                required:
+                  - name
+      responses:
+        '200':
+          description: OK
+  /test-content-header-param:
+    get:
+      summary: Test header parameter defined via content.
+      operationId: fakeapi.hello.test_content_header_param
+      parameters:
+        - name: x-filter
+          in: header
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                required:
+                  - name
+      responses:
+        '200':
+          description: OK
+  /test-content-cookie-param:
+    get:
+      summary: Test cookie parameter defined via content.
+      operationId: fakeapi.hello.test_content_cookie_param
+      parameters:
+        - name: filter
+          in: cookie
+          required: true
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  name:
+                    type: string
+                required:
+                  - name
+      responses:
+        '200':
+          description: OK
   /parameters-in-root-path:
     parameters:
       - in: query

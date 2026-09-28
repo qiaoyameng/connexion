@@ -529,6 +529,13 @@ Array and object parameters need to be serialized into lists and dicts.
         Not all combinations of `style` and `explode` are supported yet. Please open an `issue`_ if
         you run into any problems.
 
+        Alternatively, parameters can be defined via `content` instead of `schema`. In that case,
+        the parameter value is deserialized based on the media type of the content definition
+        (e.g. ``application/json``) instead of being split based on `style`, and validated against
+        the schema defined for that media type. This is supported for ``query``, ``header`` and
+        ``cookie`` parameters. A parameter cannot define `content` together with `schema`,
+        `style` or `explode`; such definitions are rejected when the spec is loaded.
+
     .. tab-item:: Swagger 2
         :sync: Swagger 2
 

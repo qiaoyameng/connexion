@@ -6,7 +6,13 @@ from jsonschema import Draft4Validator, ValidationError
 
 from connexion.exceptions import BadRequestProblem, ExtraParameterProblem
 from connexion.lifecycle import ConnexionRequest
-from connexion.utils import boolean, is_null, is_nullable
+from connexion.utils import (
+    boolean,
+    content_parameter_schema,
+    decode_content_parameter,
+    is_null,
+    is_nullable,
+)
 
 logger = logging.getLogger("connexion.validators.parameter")
 
@@ -49,7 +55,24 @@ class ParameterValidator:
 
         elif value is not None:
             param = copy.deepcopy(param)
-            param = param.get("schema", param)
+            if "content" in param:
+                # Query parameters defined via `content` are already decoded by the
+                # uri parser. Header and cookie parameters still need decoding.
+                if parameter_type in ("header", "cookie"):
+                    try:
+                        value = decode_content_parameter(value, param)
+                    except ValueError:
+                        return (
+                            "Failed to decode {parameter_type} parameter "
+                            "'{param[name]}' as {media_type}".format(
+                                parameter_type=parameter_type,
+                                param=param,
+                                media_type=next(iter(param["content"])),
+                            )
+                        )
+                param = content_parameter_schema(param)
+            else:
+                param = param.get("schema", param)
             try:
                 Draft4Validator(param, format_checker=draft4_format_checker).validate(
                     value

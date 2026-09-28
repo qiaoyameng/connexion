@@ -1,0 +1,20 @@
+openapi: 3.0.0
+info:
+  title: Invalid content parameter definitions
+  version: '1.0'
+paths:
+  /mixed:
+    get:
+      operationId: fakeapi.hello.test_content_query_param
+      parameters:
+        - name: filter
+          in: query
+          content:
+            application/json:
+              schema:
+                type: object
+          schema:
+            type: object
+      responses:
+        '200':
+          description: OK
