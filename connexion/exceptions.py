@@ -28,6 +28,24 @@ class MissingMiddleware(ConnexionException):
     and that middleware is not part of your middleware stack."""
 
 
+class LinkError(ConnexionException):
+    """Base class for errors raised while resolving OpenAPI links."""
+
+
+class MissingLinkValueError(LinkError):
+    """Error raised when a runtime expression in a link cannot be evaluated because a
+    value is missing from the request or response it is evaluated against."""
+
+
+class LinkTargetNotFoundError(LinkError):
+    """Error raised when the operation targeted by a link (via ``operationId`` or
+    ``operationRef``) does not exist."""
+
+
+class CircularLinkError(LinkError):
+    """Error raised when resolving a link leads to a circular reference."""
+
+
 # HTTP ERRORS
 
 
