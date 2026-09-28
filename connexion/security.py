@@ -450,15 +450,23 @@ class SecurityHandlerFactory:
     By default, it will use the built-in security handlers specified in the
     SECURITY_HANDLERS dict, but you can also pass in your own security handlers
     to override the built-in ones.
+
+    An optional ``identity_aggregator`` can be provided, which is called with
+    the verification results of security schemes combined in AND fashion,
+    mapping scheme names to their token infos. It should return a unified
+    identity, or reject the request by raising an exception or returning
+    ``None``. It can be a coroutine function.
     """
 
     def __init__(
         self,
         security_handlers: t.Optional[dict] = None,
+        identity_aggregator: t.Optional[t.Callable] = None,
     ) -> None:
         self.security_handlers = SECURITY_HANDLERS.copy()
         if security_handlers is not None:
             self.security_handlers.update(security_handlers)
+        self.identity_aggregator = identity_aggregator
 
     def parse_security_scheme(
         self,
@@ -554,6 +562,12 @@ class SecurityHandlerFactory:
         Verifies multiple authentication schemes in AND fashion.
         If any scheme fails, the entire authentication fails.
 
+        If an ``identity_aggregator`` is configured, it is called with the
+        verification results mapping scheme names to their token infos. It
+        should return a unified identity, which is used as the ``token_info``,
+        or reject the request by raising an exception or returning ``None``.
+        The aggregator can be a coroutine function.
+
         :param schemes: mapping scheme_name to auth function
         :type schemes: dict
         :rtype: types.FunctionType
@@ -569,6 +583,16 @@ class SecurityHandlerFactory:
                     return NO_VALUE
                 token_info[scheme_name] = result
 
+            if self.identity_aggregator is not None:
+                identity = self.identity_aggregator(token_info)
+                while asyncio.iscoroutine(identity):
+                    identity = await identity
+                if identity is None:
+                    raise OAuthResponseProblem(
+                        detail="Identity aggregation rejected the credentials"
+                    )
+                return identity
+
             return token_info
 
         return wrapper
@@ -576,32 +600,35 @@ class SecurityHandlerFactory:
     @classmethod
     def verify_security(cls, auth_funcs):
         async def verify_fn(request):
-            token_info = NO_VALUE
             errors = []
             for func in auth_funcs:
                 try:
                     token_info = func(request)
                     while asyncio.iscoroutine(token_info):
                         token_info = await token_info
-                    if token_info is not NO_VALUE:
-                        break
                 except Exception as err:
+                    # Failed branches must not pollute the request context.
                     errors.append(err)
+                    continue
+                if token_info is NO_VALUE:
+                    continue
 
-            else:
-                if errors != []:
-                    cls._raise_most_specific(errors)
-                else:
-                    logger.info("... No auth provided. Aborting with 401.")
-                    raise OAuthProblem(detail="No authorization token provided")
+                # Only the result of the successful branch is committed to the
+                # request context.
+                request.context.update(
+                    {
+                        # Fallback to 'uid' for backward compatibility
+                        "user": token_info.get("sub", token_info.get("uid")),
+                        "token_info": token_info,
+                    }
+                )
+                return
 
-            request.context.update(
-                {
-                    # Fallback to 'uid' for backward compatibility
-                    "user": token_info.get("sub", token_info.get("uid")),
-                    "token_info": token_info,
-                }
-            )
+            if errors:
+                cls._raise_most_specific(errors)
+
+            logger.info("... No auth provided. Aborting with 401.")
+            raise OAuthProblem(detail="No authorization token provided")
 
         return verify_fn
 
