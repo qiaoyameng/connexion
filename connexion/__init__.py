@@ -12,7 +12,7 @@ from .apps.asynchronous import AsyncApp
 from .datastructures import NoContent  # NOQA
 from .exceptions import ProblemException  # NOQA
 from .problem import problem  # NOQA
-from .resolver import Resolution, Resolver, RestyResolver  # NOQA
+from .resolver import DeferredResolver, Resolution, Resolver, RestyResolver  # NOQA
 from .utils import not_installed_error  # NOQA
 
 try:

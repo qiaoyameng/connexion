@@ -19,6 +19,12 @@ class ResolverError(LookupError, ConnexionException):
     your specification, and no ``resolver_error`` is configured."""
 
 
+class DeferredResolutionError(ResolverError):
+    """Error raised when a :class:`connexion.resolver.DeferredResolver` cannot (yet) bind view
+    functions to operations, either because ``finalize()`` failed or because a bound function
+    may not be replaced."""
+
+
 class InvalidSpecification(ValidationError, ConnexionException):
     """Error raised at startup when the provided specification cannot be validated."""
 

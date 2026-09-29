@@ -10,7 +10,11 @@ import typing as t
 from inflection import camelize
 
 import connexion.utils as utils
-from connexion.exceptions import ResolverError
+from connexion.exceptions import (
+    DeferredResolutionError,
+    ProblemException,
+    ResolverError,
+)
 
 logger = logging.getLogger("connexion.resolver")
 
@@ -183,6 +187,290 @@ class RestyResolver(Resolver):
             )
 
         return f"{get_controller_name()}.{get_function_name()}"
+
+
+class _DeferredResolution:
+    """
+    Holds the placeholder registered with the framework in place of the actual view
+    function. The placeholder is bound to the actual function when the
+    :class:`DeferredResolver` is finalized. Until then, it raises a 503 ProblemException
+    when called, so no business logic is served.
+    """
+
+    __slots__ = ("operation_id", "function", "placeholder")
+
+    def __init__(self, operation_id: t.Optional[str]):
+        self.operation_id = operation_id
+        self.function: t.Optional[t.Callable] = None
+
+        async def placeholder(*args, **kwargs):
+            function = self.function
+            if function is None:
+                raise ProblemException(
+                    status=503,
+                    title="Service unavailable",
+                    detail=(
+                        f'Operation "{self.operation_id}" is not available yet. The '
+                        "application registered its APIs with a DeferredResolver that "
+                        "has not been finalized."
+                    ),
+                )
+            result = function(*args, **kwargs)
+            if inspect.isawaitable(result):
+                return await result
+            return result
+
+        # Flask requires view function names without dots.
+        name = f"deferred_{operation_id}".replace(".", "_")
+        setattr(placeholder, "__name__", name)
+        setattr(placeholder, "__qualname__", name)
+        self.placeholder = placeholder
+
+    def bind(self, function: t.Callable) -> None:
+        self.function = function
+        # Expose the bound function so introspection (signatures, coroutine detection)
+        # sees the actual view function once bound.
+        setattr(self.placeholder, "__wrapped__", function)
+
+    def __repr__(self) -> str:
+        state = f"bound to {self.function!r}" if self.function else "unbound"
+        return f"<_DeferredResolution {self.operation_id!r} ({state})>"
+
+
+class DeferredResolver(Resolver):
+    """
+    Resolver that defers binding of view functions to an explicit :meth:`finalize` call.
+
+    This supports plugin startup orders in which the specifications are loaded before all
+    view functions are available:
+
+    1. APIs are registered as usual via ``add_api(..., resolver=DeferredResolver())``. No
+       view functions are needed yet. Operations registered before finalization are
+       bound to placeholders, so no business logic is served (requests receive a 503
+       response).
+    2. Plugins register their view functions per operationId via :meth:`register_function`.
+    3. :meth:`finalize` binds all operations at once. It raises a
+       :class:`connexion.exceptions.DeferredResolutionError` listing all missing and
+       duplicate bindings, as well as any signature mismatches between the registered
+       functions and the parameter mapping of their operations. If finalization fails,
+       no operation is bound, so a half-configured set of routes is never exposed.
+       Missing or conflicting registrations can be fixed, after which :meth:`finalize`
+       can be retried.
+
+    Note that connexion registers operations when its middleware stack is built, which
+    happens at the latest when the first request is received. :meth:`finalize` validates
+    all operations known at that point, and can be called again if more operations were
+    registered in the meantime.
+
+    After successful finalization, functions bound to an operationId can no longer be
+    replaced, and unknown operationIds raise a
+    :class:`connexion.exceptions.ResolverError`, like with the standard
+    :class:`Resolver`.
+    """
+
+    def __init__(self, resolver: t.Optional[Resolver] = None):
+        """
+        :param resolver: Resolver to delegate operationId resolution to. Defaults to the
+            standard :class:`Resolver`. Pass e.g. a :class:`RestyResolver` or
+            :class:`MethodViewResolver` to use their operationId semantics.
+        """
+        super().__init__()
+        self.resolver = resolver or Resolver()
+        self._pending: t.Dict[
+            t.Optional[str], t.List[t.Tuple[t.Any, _DeferredResolution]]
+        ] = {}
+        self._registrations: t.Dict[str, t.List[t.Callable]] = {}
+        self._functions: t.Dict[str, t.Callable] = {}
+        self._finalized = False
+
+    @property
+    def finalized(self) -> bool:
+        """Whether the resolver has been successfully finalized at least once."""
+        return self._finalized
+
+    @property
+    def pending_operation_ids(self) -> t.List[t.Optional[str]]:
+        """Operation ids of operations still waiting to be bound by :meth:`finalize`."""
+        return list(self._pending)
+
+    def resolve_operation_id(self, operation):
+        return self.resolver.resolve_operation_id(operation)
+
+    def resolve(self, operation):
+        operation_id = self.resolve_operation_id(operation)
+        try:
+            function = self._functions[operation_id]
+        except KeyError:
+            if self._finalized:
+                raise ResolverError(
+                    f'Cannot resolve operationId "{operation_id}"! No function was '
+                    "registered for it."
+                )
+        else:
+            return Resolution(function, operation_id)
+
+        deferred = _DeferredResolution(operation_id)
+        self._pending.setdefault(operation_id, []).append((operation, deferred))
+        return Resolution(deferred.placeholder, operation_id)
+
+    def register_function(self, operation_id: str, function: t.Callable) -> None:
+        """
+        Register a view function for an operationId. Called by plugins to provide the
+        business logic for operations that were registered before they were available.
+
+        Registering multiple different functions for the same operationId is reported
+        as an error by :meth:`finalize`. After finalization, functions are bound
+        immediately, and functions already bound to an operationId can no longer be
+        replaced.
+        """
+        if operation_id in self._functions:
+            raise DeferredResolutionError(
+                f'Cannot replace the function already bound to operationId '
+                f'"{operation_id}".'
+            )
+        if self._finalized:
+            self._functions[operation_id] = function
+            for _, deferred in self._pending.pop(operation_id, []):
+                deferred.bind(function)
+            return
+        functions = self._registrations.setdefault(operation_id, [])
+        if function not in functions:
+            functions.append(function)
+
+    def unregister_function(
+        self, operation_id: str, function: t.Optional[t.Callable] = None
+    ) -> None:
+        """
+        Remove registrations for an operationId, e.g. to fix duplicate registrations
+        reported by a failed :meth:`finalize`. If ``function`` is provided, only that
+        function is removed, otherwise all registrations for the operationId are removed.
+        """
+        if operation_id in self._functions:
+            raise DeferredResolutionError(
+                f'Cannot unregister the function already bound to operationId '
+                f'"{operation_id}".'
+            )
+        functions = self._registrations.get(operation_id)
+        if not functions:
+            return
+        if function is None:
+            functions.clear()
+        else:
+            while function in functions:
+                functions.remove(function)
+
+    def finalize(self) -> None:
+        """
+        Bind all known operations to their registered view functions at once.
+
+        Raises a :class:`connexion.exceptions.DeferredResolutionError` listing all
+        missing and duplicate bindings and all signature mismatches. If any error is
+        found, no operation is bound, and ``finalize`` can be retried after fixing the
+        registrations.
+        """
+        errors = []
+
+        for operation_id, functions in self._registrations.items():
+            if len(functions) > 1:
+                names = ", ".join(_qualname(f) for f in functions)
+                errors.append(
+                    f'Multiple functions registered for operationId "{operation_id}": '
+                    f"{names}."
+                )
+
+        for operation_id, pending in self._pending.items():
+            functions = self._registrations.get(operation_id, [])
+            if not functions:
+                errors.append(f'No function registered for operationId "{operation_id}".')
+                continue
+            if len(functions) == 1:
+                function = functions[0]
+                for operation, _ in pending:
+                    try:
+                        self._validate_arguments(operation, operation_id, function)
+                    except DeferredResolutionError as e:
+                        errors.append(str(e))
+
+        if errors:
+            raise DeferredResolutionError(
+                "Could not finalize deferred resolution:\n- "
+                + "\n- ".join(dict.fromkeys(errors))
+            )
+
+        # Commit the registrations and bind all pending operations.
+        for operation_id, functions in self._registrations.items():
+            self._functions[operation_id] = functions[0]
+        self._registrations.clear()
+        for operation_id, pending in self._pending.items():
+            function = self._functions[operation_id]
+            for _, deferred in pending:
+                deferred.bind(function)
+        self._pending.clear()
+        self._finalized = True
+
+    def _validate_arguments(
+        self, operation, operation_id: t.Optional[str], function: t.Callable
+    ) -> None:
+        """
+        Validate that the arguments required by the function are provided by the
+        parameter mapping of the operation.
+        """
+        from connexion.decorators.parameter import unwrap_decorators
+
+        try:
+            signature = inspect.signature(unwrap_decorators(function))
+        except (TypeError, ValueError):
+            # Cannot inspect the signature, so we cannot validate it.
+            return
+        parameters = list(signature.parameters.values())
+        if any(p.kind == p.VAR_KEYWORD for p in parameters):
+            return
+        provided = self._provided_arguments(operation)
+        missing = [
+            p.name
+            for p in parameters
+            if p.default is p.empty
+            and p.kind
+            in (p.POSITIONAL_ONLY, p.POSITIONAL_OR_KEYWORD, p.KEYWORD_ONLY)
+            and p.name not in ("self", "cls")
+            and p.name not in provided
+        ]
+        if missing:
+            raise DeferredResolutionError(
+                f'Function "{_qualname(function)}" registered for operationId '
+                f'"{operation_id}" requires argument(s) {", ".join(missing)} which '
+                f"are not provided by the parameters of "
+                f'"{operation.method.upper()} {operation.path}".'
+            )
+
+    @staticmethod
+    def _provided_arguments(operation) -> t.Set[str]:
+        """
+        Compute the argument names connexion can pass to the view function of the
+        operation, taking parameter sanitization into account.
+        """
+        from connexion.decorators.parameter import CONTEXT_NAME, pythonic, sanitized
+
+        names = {CONTEXT_NAME}
+        for parameter in operation.parameters:
+            if parameter.get("in") in ("path", "query", "formData", "body"):
+                names.add(parameter["name"])
+        if operation.is_request_body_defined:
+            try:
+                names.add(operation.body_name(None))
+            except Exception:  # pragma: no cover - defensive
+                names.add("body")
+
+        provided = set()
+        for name in names:
+            provided.update((name, sanitized(name), pythonic(name)))
+        return provided
+
+
+def _qualname(function: t.Callable) -> str:
+    return getattr(function, "__qualname__", None) or getattr(
+        function, "__name__", repr(function)
+    )
 
 
 class MethodResolverBase(RestyResolver):

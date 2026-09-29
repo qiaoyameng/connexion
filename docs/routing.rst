@@ -318,6 +318,70 @@ You can import and extend ``connexion.resolver.Resolver`` to implement your own
     If you implement a custom ``Resolver``, and think it would be valuable for other users, we
     would appreciate it as a contribution.
 
+DeferredResolver
+````````````````
+
+The ``DeferredResolver`` supports plugin architectures in which the specifications are
+loaded before all view functions are available. Instead of resolving ``operationIds`` to
+view functions immediately, it lets you register the API first, have plugins register
+their view functions afterwards, and then bind everything with an explicit
+``finalize()`` call:
+
+.. code-block:: python
+    :caption: **app.py**
+
+    import connexion
+    from connexion.resolver import DeferredResolver
+
+    resolver = DeferredResolver()
+
+    app = connexion.FlaskApp(__name__)
+    app.add_api('openapi.yaml', resolver=resolver)
+
+    # Plugins register their view functions per operationId
+    resolver.register_function('myapp.api.hello_world', hello_world)
+
+    # Bind all operations at once
+    resolver.finalize()
+
+Until the resolver is finalized, operations are bound to placeholders and requests to
+them receive a ``503`` response, so no business logic is served yet.
+
+``finalize()`` validates all operations at once and raises a
+``DeferredResolutionError`` listing every missing and duplicate binding, as well as any
+mismatch between the signature of a registered function and the parameters its
+operation provides. If finalization fails, no operation is bound, so a half-configured
+set of routes is never exposed. You can then fix the registrations (using
+``unregister_function()`` to remove duplicates) and call ``finalize()`` again.
+
+After successful finalization, functions bound to an ``operationId`` can no longer be
+replaced, and unknown ``operationIds`` raise a ``ResolverError``, like with the
+standard ``Resolver``.
+
+The same function can be registered for multiple ``operationIds``, and multiple specs
+can reference the same function via the same ``operationId``. To use the ``operationId``
+semantics of another resolver (e.g. to bind Flask ``MethodView`` classes), pass it to
+the ``DeferredResolver``:
+
+.. code-block:: python
+    :caption: **app.py**
+
+    from connexion.resolver import DeferredResolver, MethodViewResolver
+
+    resolver = DeferredResolver(MethodViewResolver('myapp.api'))
+
+.. note::
+
+    Connexion registers operations when its middleware stack is built, which happens at
+    the latest when the first request is received. ``finalize()`` validates all
+    operations known at that point, and can be called again if more operations were
+    registered in the meantime.
+
+.. dropdown:: View a detailed reference of the :code:`DeferredResolver` class
+    :icon: eye
+
+    .. autoclass:: connexion.resolver.DeferredResolver
+        :members:
 
 Resolver error
 --------------
