@@ -318,6 +318,65 @@ You can import and extend ``connexion.resolver.Resolver`` to implement your own
     If you implement a custom ``Resolver``, and think it would be valuable for other users, we
     would appreciate it as a contribution.
 
+DeferredResolver
+````````````````
+
+The ``DeferredResolver`` decouples registering an API from registering its handler
+functions. This is useful when your application is composed of plugins that are not
+yet loaded when the API specification is registered. The specification can be
+registered first, after which plugins register their handler functions, and a final
+call to ``finalize()`` binds all operations at once:
+
+.. code-block:: python
+    :caption: **app.py**
+
+    import connexion
+    from connexion.resolver import DeferredResolver
+
+    resolver = DeferredResolver()
+
+    app = connexion.FlaskApp(__name__)
+    app.add_api('openapi.yaml', resolver=resolver)
+
+    # Plugins register their handlers, either directly or as a decorator
+    resolver.register('my_operation', my_handler)
+
+    @resolver.register('my_other_operation')
+    def my_other_handler():
+        ...
+
+    # Bind all operations at once
+    resolver.finalize()
+
+Until the resolver is finalized, requests to its operations are rejected.
+``finalize()`` validates all pending operations and reports all missing or
+conflicting bindings, as well as mismatches between the specification parameters
+and the handler signatures, in a single ``DeferredResolverError``. If finalization
+fails, no operations are bound, so your application never serves a partially bound
+API. Registrations can be corrected (using ``replace=True`` to overwrite an earlier
+registration) and ``finalize()`` retried.
+
+Multiple operations, possibly from multiple specifications, can share a single
+handler by registering it once under their shared ``operationId``. Handlers can
+also be registered for a class with an ``as_view`` method (such as a Flask
+``MethodView``), in which case operations with operationIds of the form
+``<operation_id>.<method>`` are bound to a shared view:
+
+.. code-block:: python
+
+    resolver.register('api.PetsView', PetsView)
+    # Binds operations 'api.PetsView.get', 'api.PetsView.post', ...
+
+Once finalized, the resolver behaves like a regular resolver: operations of APIs
+added later are resolved immediately, and handlers that have been bound can no
+longer be replaced.
+
+.. dropdown:: View a detailed reference of the :code:`DeferredResolver` class
+    :icon: eye
+
+    .. autoclass:: connexion.resolver.DeferredResolver
+        :members:
+
 
 Resolver error
 --------------

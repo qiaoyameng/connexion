@@ -19,6 +19,19 @@ class ResolverError(LookupError, ConnexionException):
     your specification, and no ``resolver_error`` is configured."""
 
 
+class DeferredResolverError(ResolverError):
+    """Error raised when a :class:`~connexion.resolver.DeferredResolver` cannot be finalized,
+    or when an operation is called before the resolver has been finalized.
+
+    When raised by ``finalize()``, all problems encountered while binding the pending
+    operations are listed in ``errors``.
+    """
+
+    def __init__(self, message: str, *, errors: t.Optional[t.List[str]] = None) -> None:
+        super().__init__(message)
+        self.errors: t.List[str] = errors or []
+
+
 class InvalidSpecification(ValidationError, ConnexionException):
     """Error raised at startup when the provided specification cannot be validated."""
 

@@ -3,6 +3,7 @@ This module contains resolvers, functions that resolves the user defined view fu
 from the operations defined in the OpenAPI spec.
 """
 
+import functools
 import inspect
 import logging
 import typing as t
@@ -10,9 +11,17 @@ import typing as t
 from inflection import camelize
 
 import connexion.utils as utils
-from connexion.exceptions import ResolverError
+from connexion.exceptions import DeferredResolverError, ResolverError
+from connexion.http_facts import METHODS
 
 logger = logging.getLogger("connexion.resolver")
+
+#: Method names that are resolved on registered view classes and instances.
+VIEW_METHODS = METHODS | {"search"}
+
+#: Argument names that Connexion injects at request time instead of mapping them
+#: from the specification. They are excluded from signature validation.
+CONTEXT_ARGUMENTS = frozenset({"context_", "user", "token_info"})
 
 
 class Resolution:
@@ -72,6 +81,335 @@ class Resolver:
             raise ResolverError(msg)
         except (AttributeError, ValueError) as e:
             raise ResolverError(str(e))
+
+
+def _is_view_class(handler) -> bool:
+    """Whether the handler is a class with an ``as_view`` method, such as a
+    Flask ``MethodView``."""
+    return inspect.isclass(handler) and hasattr(handler, "as_view")
+
+
+def _unwrap(function):
+    """Unwrap decorators to return the original function."""
+    while hasattr(function, "__wrapped__"):
+        function = function.__wrapped__
+    return function
+
+
+class DeferredResolver(Resolver):
+    """
+    Resolver that decouples registering an API from registering its handler functions.
+
+    This is useful when the application is composed of plugins that are not yet loaded
+    when the API specification is registered. The specification can be registered first,
+    after which plugins register their handler functions, and a final call to
+    :meth:`finalize` binds all pending operations at once:
+
+    .. code-block:: python
+
+        resolver = DeferredResolver()
+        app.add_api("openapi.yaml", resolver=resolver)
+
+        # Plugins register their handlers
+        resolver.register("my_operation", my_handler)
+
+        # Bind all operations at once
+        resolver.finalize()
+
+    Until the resolver is finalized, requests to its operations are rejected.
+    ``finalize()`` validates all pending operations and reports all missing or
+    conflicting bindings, as well as any mismatches between the specification
+    parameters and the handler signatures, in a single error. If finalization fails,
+    no operations are bound, so the application never serves a partially bound API.
+    Registrations can be corrected and ``finalize()`` retried. Once finalized, the
+    resolver behaves like a regular resolver and bound handlers can no longer be
+    replaced.
+    """
+
+    def __init__(self, function_resolver: t.Callable = utils.get_function_from_name):
+        super().__init__(function_resolver=function_resolver)
+        self._registrations: t.Dict[str, t.List[t.Callable]] = {}
+        self._pending: t.Dict[str, t.List[t.Tuple[t.Any, Resolution]]] = {}
+        self._bindings: t.Dict[str, t.Callable] = {}
+        self._view_cache: t.Dict[type, t.Callable] = {}
+        self._finalized = False
+
+    @property
+    def finalized(self) -> bool:
+        """Whether the resolver has been finalized."""
+        return self._finalized
+
+    @property
+    def pending_operation_ids(self) -> t.List[str]:
+        """The operationIds that are still waiting to be bound by ``finalize()``."""
+        return list(self._pending)
+
+    def register(
+        self,
+        operation_id: str,
+        handler: t.Optional[t.Callable] = None,
+        *,
+        replace: bool = False,
+    ) -> t.Optional[t.Callable]:
+        """
+        Register a handler for an operationId. Can be used as a decorator.
+
+        :param operation_id: The operationId to bind the handler to, as resolved from
+            the specification (including any router controller prefix).
+        :param handler: The handler to bind. This can be a callable, or a class with an
+            ``as_view`` method (such as a Flask ``MethodView``), in which case operations
+            with operationIds of the form ``<operation_id>.<method>`` are bound to a
+            shared view. Instances are supported as well, in which case such operations
+            are bound to the corresponding method of the instance.
+        :param replace: Whether to replace earlier registrations for the same
+            operationId instead of recording a conflicting binding.
+
+        :return: The registered handler, so this method can be used as a decorator.
+        """
+        if handler is None:
+            # Used as a decorator
+            return functools.partial(self.register, operation_id, replace=replace)
+
+        if not callable(handler) and not any(
+            hasattr(handler, method) for method in VIEW_METHODS
+        ):
+            raise TypeError(
+                f'Handler registered for operationId "{operation_id}" must be '
+                f"callable or expose view methods, got {handler!r}."
+            )
+
+        if self._finalized:
+            if operation_id in self._bindings or operation_id in self._registrations:
+                raise ResolverError(
+                    f'Cannot register handler for operationId "{operation_id}": the '
+                    "resolver has already been finalized and its bindings can no "
+                    "longer be replaced."
+                )
+            # Allow registering handlers for APIs added after finalization.
+            self._registrations[operation_id] = [handler]
+            if callable(handler) and not _is_view_class(handler):
+                self._bindings[operation_id] = handler
+            return handler
+
+        if replace:
+            self._registrations[operation_id] = [handler]
+        else:
+            self._registrations.setdefault(operation_id, []).append(handler)
+        return handler
+
+    def resolve(self, operation):
+        """
+        Resolve the operation. Before finalization, a placeholder is returned which
+        rejects requests until :meth:`finalize` binds the actual handler. After
+        finalization, operations are resolved immediately.
+
+        :type operation: connexion.operations.AbstractOperation
+        """
+        if self._finalized:
+            return super().resolve(operation)
+
+        operation_id = self.resolve_operation_id(operation)
+        resolution = Resolution(self._placeholder(operation_id), operation_id)
+        self._pending.setdefault(operation_id, []).append((operation, resolution))
+        return resolution
+
+    def resolve_function_from_operation_id(self, operation_id):
+        """
+        Resolve a previously registered handler for an operationId.
+
+        :type operation_id: str
+        """
+        handler = self._resolve_from_registries(operation_id)
+        if handler is None:
+            raise ResolverError(
+                f'Cannot resolve operationId "{operation_id}"! No handler has been '
+                "registered for it."
+            )
+        return handler
+
+    def finalize(self) -> None:
+        """
+        Bind all pending operations to their registered handlers at once.
+
+        All pending operations are validated, and all missing or conflicting bindings
+        and signature mismatches are reported in a single
+        :class:`~connexion.exceptions.DeferredResolverError`. If finalization fails,
+        no bindings are published, so the application never serves a partially bound
+        API. Registrations can be corrected and ``finalize()`` retried.
+        """
+        if self._finalized:
+            return
+
+        errors: t.List[str] = []
+        bindings: t.Dict[str, t.Callable] = {}
+
+        conflicted = set()
+        for operation_id, handlers in self._registrations.items():
+            if len(self._distinct(handlers)) > 1:
+                conflicted.add(operation_id)
+                errors.append(
+                    f'Multiple conflicting handlers registered for operationId '
+                    f'"{operation_id}".'
+                )
+
+        for operation_id, pending in self._pending.items():
+            if operation_id in conflicted:
+                continue
+            handler = self._resolve_from_registries(operation_id)
+            if handler is None:
+                errors.append(
+                    f'No handler registered for operationId "{operation_id}".'
+                )
+                continue
+            bindings[operation_id] = handler
+            for operation, _ in pending:
+                errors.extend(self._validate_operation(operation, handler))
+
+        if errors:
+            raise DeferredResolverError(
+                "Could not finalize deferred resolver. The following problems were "
+                "found:\n- " + "\n- ".join(errors),
+                errors=errors,
+            )
+
+        # Publish all bindings at once, so a failed finalize never leaves a
+        # partially bound API behind.
+        self._bindings.update(bindings)
+        for operation_id, pending in self._pending.items():
+            for _, resolution in pending:
+                resolution.function = bindings[operation_id]
+        self._pending.clear()
+        self._finalized = True
+
+    def _placeholder(self, operation_id: str) -> t.Callable:
+        """Build a placeholder that rejects requests until the handler is bound."""
+
+        def deferred_handler(*args, **kwargs):
+            handler = self._bindings.get(operation_id)
+            if handler is None:
+                raise DeferredResolverError(
+                    f'Operation "{operation_id}" was called before its handler was '
+                    "bound. Register all handlers and call `finalize()` before "
+                    "serving requests."
+                )
+            return handler(*args, **kwargs)
+
+        return deferred_handler
+
+    def _resolve_from_registries(self, operation_id: str) -> t.Optional[t.Callable]:
+        """Look up the handler for an operationId in the published bindings and
+        registrations."""
+        if operation_id in self._bindings:
+            return self._bindings[operation_id]
+
+        handlers = self._distinct(self._registrations.get(operation_id, ()))
+        if len(handlers) == 1:
+            handler = handlers[0]
+            if _is_view_class(handler):
+                return self._view_function(handler)
+            return handler
+
+        # Look up `<operation_id>.<method>` on a registered view class or instance.
+        parent, _, method_name = operation_id.rpartition(".")
+        if parent:
+            parents = self._distinct(self._registrations.get(parent, ()))
+            if len(parents) == 1:
+                parent_handler = parents[0]
+                if _is_view_class(parent_handler):
+                    if hasattr(parent_handler, method_name):
+                        return self._view_function(parent_handler)
+                elif hasattr(parent_handler, method_name):
+                    return getattr(parent_handler, method_name)
+        return None
+
+    def _view_function(self, view_class: type) -> t.Callable:
+        """Return a shared view function for a view class, such as a Flask
+        ``MethodView``."""
+        if view_class not in self._view_cache:
+            self._view_cache[view_class] = view_class.as_view(view_class.__name__)
+        return self._view_cache[view_class]
+
+    @staticmethod
+    def _distinct(handlers: t.Iterable[t.Callable]) -> t.List[t.Callable]:
+        """Return the distinct handlers, preserving registration order."""
+        distinct = []
+        for handler in handlers:
+            if not any(handler is seen for seen in distinct):
+                distinct.append(handler)
+        return distinct
+
+    def _validate_operation(self, operation, handler: t.Callable) -> t.List[str]:
+        """Validate that the handler signature matches the parameter mapping of the
+        operation."""
+        from connexion.decorators.parameter import sanitized
+
+        try:
+            signature = inspect.signature(_unwrap(handler))
+        except (TypeError, ValueError):
+            # Some callables (e.g. some builtins) have no introspectable signature.
+            return []
+
+        parameters = signature.parameters
+        accepted = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.kind
+            not in (parameter.VAR_POSITIONAL, parameter.VAR_KEYWORD)
+        }
+        has_kwargs = any(
+            parameter.kind == parameter.VAR_KEYWORD
+            for parameter in parameters.values()
+        )
+        positional_only = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.kind == parameter.POSITIONAL_ONLY
+        }
+        required = {
+            name
+            for name, parameter in parameters.items()
+            if parameter.default is parameter.empty
+            and parameter.kind
+            in (parameter.POSITIONAL_OR_KEYWORD, parameter.KEYWORD_ONLY)
+        }
+
+        expected = set()
+        for parameter in operation.parameters:
+            name = sanitized(parameter.get("name"))
+            if name:
+                expected.add(name)
+        if operation.is_request_body_defined:
+            try:
+                body_name = operation.body_name(None)
+            except Exception:  # pragma: no cover
+                body_name = "body"
+            name = sanitized(body_name)
+            if name:
+                expected.add(name)
+
+        operation_id = operation.operation_id
+        handler_name = getattr(handler, "__qualname__", repr(handler))
+        errors = []
+
+        for name in sorted(positional_only):
+            errors.append(
+                f'Operation "{operation_id}": argument "{name}" of handler '
+                f'"{handler_name}" is positional-only, but Connexion passes '
+                "arguments by keyword."
+            )
+        if not has_kwargs:
+            for name in sorted(expected - accepted):
+                errors.append(
+                    f'Operation "{operation_id}": parameter "{name}" is defined in '
+                    f'the specification, but not accepted by handler '
+                    f'"{handler_name}".'
+                )
+        for name in sorted(required - expected - CONTEXT_ARGUMENTS):
+            errors.append(
+                f'Operation "{operation_id}": required argument "{name}" of handler '
+                f'"{handler_name}" is not provided by the specification.'
+            )
+        return errors
 
 
 class RelativeResolver(Resolver):
