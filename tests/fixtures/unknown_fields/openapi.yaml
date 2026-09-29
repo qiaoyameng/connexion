@@ -1,0 +1,125 @@
+openapi: "3.0.0"
+
+info:
+  title: "Unknown fields API"
+  version: "1.0"
+
+servers:
+  - url: /v1.0
+
+paths:
+  /reject:
+    post:
+      operationId: fakeapi.unknown_fields.reject
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Closed"
+      responses:
+        "200":
+          description: OK
+
+  /keep:
+    post:
+      operationId: fakeapi.unknown_fields.keep
+      x-unknown-fields: keep
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Closed"
+      responses:
+        "200":
+          description: OK
+
+  /strip:
+    post:
+      operationId: fakeapi.unknown_fields.strip
+      x-unknown-fields: strip
+      requestBody:
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/Closed"
+      responses:
+        "200":
+          description: OK
+
+  /strip-composed:
+    post:
+      operationId: fakeapi.unknown_fields.strip_composed
+      x-unknown-fields: strip
+      requestBody:
+        content:
+          application/json:
+            schema:
+              allOf:
+                - type: object
+                  additionalProperties: false
+                  properties:
+                    name:
+                      type: string
+                    pets:
+                      type: array
+                      items:
+                        type: object
+                        additionalProperties: false
+                        properties:
+                          name:
+                            type: string
+                - type: object
+                  properties:
+                    name:
+                      minLength: 1
+      responses:
+        "200":
+          description: OK
+
+  /strip-oneof:
+    post:
+      operationId: fakeapi.unknown_fields.strip_oneof
+      x-unknown-fields: strip
+      requestBody:
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/Cat"
+                - $ref: "#/components/schemas/Dog"
+      responses:
+        "200":
+          description: OK
+
+components:
+  schemas:
+    Closed:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+    Cat:
+      type: object
+      additionalProperties: false
+      required:
+        - hunts
+      properties:
+        name:
+          type: string
+        hunts:
+          type: boolean
+        lives:
+          type: integer
+    Dog:
+      type: object
+      additionalProperties: false
+      required:
+        - barks
+      properties:
+        name:
+          type: string
+        barks:
+          type: boolean
+        walks:
+          type: integer

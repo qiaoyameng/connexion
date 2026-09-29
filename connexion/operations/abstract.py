@@ -7,6 +7,7 @@ import abc
 import logging
 import typing as t
 
+from connexion.json_schema import UNKNOWN_FIELDS_POLICIES
 from connexion.utils import all_json
 
 logger = logging.getLogger("connexion.operations.abstract")
@@ -77,6 +78,14 @@ class AbstractOperation(metaclass=abc.ABCMeta):
 
         self._responses = self._operation.get("responses", {})
 
+        unknown_fields_policy = self._operation.get("x-unknown-fields", "reject")
+        if unknown_fields_policy not in UNKNOWN_FIELDS_POLICIES:
+            raise ValueError(
+                f"Invalid `x-unknown-fields` policy: {unknown_fields_policy}. "
+                f"Should be one of {UNKNOWN_FIELDS_POLICIES}."
+            )
+        self._unknown_fields_policy = unknown_fields_policy
+
     @classmethod
     @abc.abstractmethod
     def from_spec(cls, spec, *args, path, method, resolver, **kwargs):
@@ -119,6 +128,14 @@ class AbstractOperation(metaclass=abc.ABCMeta):
         Returns the responses for this operation
         """
         return self._responses
+
+    @property
+    def unknown_fields_policy(self) -> str:
+        """The operation-level policy for unknown fields in the request body on objects
+        declared as closed (``additionalProperties: false``), as configured via the
+        ``x-unknown-fields`` extension. One of ``reject`` (the default, which preserves
+        the standard behavior), ``strip`` or ``keep``."""
+        return self._unknown_fields_policy
 
     @property
     def operation_id(self):

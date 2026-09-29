@@ -36,6 +36,7 @@ class AbstractRequestBodyValidator:
         nullable: bool = False,
         encoding: str,
         strict_validation: bool,
+        unknown_fields: str = "reject",
         **kwargs,
     ):
         """
@@ -45,12 +46,15 @@ class AbstractRequestBodyValidator:
         :param encoding: Encoding of body (passed via Content-Type header)
         :param kwargs: Additional arguments for subclasses
         :param strict_validation: Whether to allow parameters not defined in the spec
+        :param unknown_fields: Policy for unknown fields on objects declared as closed
+            (``additionalProperties: false``): ``reject``, ``strip`` or ``keep``
         """
         self._schema = schema
         self._nullable = nullable
         self._required = required
         self._encoding = encoding
         self._strict_validation = strict_validation
+        self._unknown_fields = unknown_fields
 
     async def _parse(
         self, stream: t.AsyncGenerator[bytes, None], scope: Scope

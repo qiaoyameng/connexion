@@ -1,0 +1,22 @@
+openapi: "3.0.0"
+
+info:
+  title: "Invalid unknown fields API"
+  version: "1.0"
+
+servers:
+  - url: /v1.0
+
+paths:
+  /invalid:
+    post:
+      operationId: fakeapi.hello.forward
+      x-unknown-fields: drop
+      requestBody:
+        content:
+          application/json:
+            schema:
+              type: object
+      responses:
+        "200":
+          description: OK

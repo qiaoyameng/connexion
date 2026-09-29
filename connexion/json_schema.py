@@ -175,3 +175,176 @@ Draft4ResponseValidator = extend(
         "x-writeOnly": validate_writeOnly,
     },
 )
+
+
+UNKNOWN_FIELDS_POLICIES = ("reject", "strip", "keep")
+"""Available policies for the operation-level ``x-unknown-fields`` extension."""
+
+
+def allow_unknown_fields(validation_fn: t.Callable) -> t.Callable:
+    """Extend the ``additionalProperties`` validation function to ignore
+    ``additionalProperties: false``, effectively allowing unknown fields on objects
+    declared as closed."""
+
+    def ignore_closed_validation_fn(validator, additional_properties, instance, schema):
+        if additional_properties is False:
+            return
+
+        yield from validation_fn(validator, additional_properties, instance, schema)
+
+    return ignore_closed_validation_fn
+
+
+Draft4KeepUnknownFieldsValidator = extend(
+    Draft4RequestValidator,
+    {
+        "additionalProperties": allow_unknown_fields(
+            Draft4Validator.VALIDATORS["additionalProperties"]
+        )
+    },
+)
+"""Request validator that allows unknown fields, even on objects declared as closed
+via ``additionalProperties: false``."""
+
+
+def _is_valid_ignoring_unknown_fields(schema: dict, instance: t.Any) -> bool:
+    """Check whether an instance would validate against a schema if unknown fields on
+    closed objects were allowed."""
+    return Draft4KeepUnknownFieldsValidator(schema).is_valid(instance)
+
+
+def _allowed_keys(schema: dict, instance: dict) -> t.Optional[set]:
+    """Compute the set of property names allowed for ``instance`` under ``schema``.
+
+    Returns ``None`` if the schema does not restrict property names. Constraints from
+    ``allOf`` are intersected, while constraints from ``oneOf``/``anyOf`` are unioned
+    over the branches the instance can still match when unknown fields are ignored.
+    If no branch can match, the instance is left untouched so validation can report
+    the error instead of stripping fields that are valid in another branch.
+    """
+    allowed = None
+
+    def restrict(names: t.Optional[set]) -> None:
+        nonlocal allowed
+        if names is None:
+            return
+        allowed = names if allowed is None else allowed & names
+
+    if (
+        schema.get("additionalProperties", True) is False
+        and "patternProperties" not in schema
+    ):
+        restrict(set(schema.get("properties", {})))
+
+    for subschema in schema.get("allOf", []):
+        restrict(_allowed_keys(subschema, instance))
+
+    for keyword in ("oneOf", "anyOf"):
+        branches = schema.get(keyword)
+        if not branches:
+            continue
+        union = None
+        for branch in branches:
+            if not _is_valid_ignoring_unknown_fields(branch, instance):
+                continue
+            branch_keys = _allowed_keys(branch, instance)
+            if branch_keys is None:
+                # A matching branch does not restrict property names.
+                union = None
+                break
+            union = branch_keys if union is None else union | branch_keys
+        restrict(union)
+
+    return allowed
+
+
+def _property_subschemas(schema: dict, instance: dict, key: str) -> t.List[dict]:
+    """Collect the subschemas describing property ``key`` from the schema itself, its
+    ``allOf`` subschemas and the ``oneOf``/``anyOf`` branches the instance can still
+    match when unknown fields are ignored."""
+    subschemas = []
+
+    properties = schema.get("properties", {})
+    if key in properties:
+        subschemas.append(properties[key])
+    else:
+        additional = schema.get("additionalProperties")
+        if isinstance(additional, dict):
+            subschemas.append(additional)
+
+    for subschema in schema.get("allOf", []):
+        subschemas.extend(_property_subschemas(subschema, instance, key))
+
+    for keyword in ("oneOf", "anyOf"):
+        for branch in schema.get(keyword, []):
+            if _is_valid_ignoring_unknown_fields(branch, instance):
+                subschemas.extend(_property_subschemas(branch, instance, key))
+
+    return subschemas
+
+
+def _item_subschemas(schema: dict, instance: list) -> t.List[dict]:
+    """Collect the subschemas describing the items of an array, analogous to
+    :func:`_property_subschemas`."""
+    subschemas = []
+
+    items = schema.get("items")
+    if isinstance(items, dict):
+        subschemas.append(items)
+
+    for subschema in schema.get("allOf", []):
+        subschemas.extend(_item_subschemas(subschema, instance))
+
+    for keyword in ("oneOf", "anyOf"):
+        for branch in schema.get(keyword, []):
+            if _is_valid_ignoring_unknown_fields(branch, instance):
+                subschemas.extend(_item_subschemas(branch, instance))
+
+    return subschemas
+
+
+def _strip(instance: t.Any, schema: dict, path: tuple, removed: list) -> None:
+    if isinstance(instance, dict):
+        allowed = _allowed_keys(schema, instance)
+        if allowed is not None:
+            for key in list(instance):
+                if key not in allowed:
+                    del instance[key]
+                    removed.append(".".join(path + (key,)))
+
+        for key, value in instance.items():
+            subschemas = _property_subschemas(schema, instance, key)
+            if len(subschemas) == 1:
+                _strip(value, subschemas[0], path + (key,), removed)
+            elif subschemas:
+                _strip(value, {"anyOf": subschemas}, path + (key,), removed)
+
+    elif isinstance(instance, list):
+        items = schema.get("items")
+        if isinstance(items, list):
+            # Tuple validation
+            for i, (item, subschema) in enumerate(zip(instance, items)):
+                _strip(item, subschema, path + (str(i),), removed)
+        else:
+            subschemas = _item_subschemas(schema, instance)
+            for i, item in enumerate(instance):
+                if len(subschemas) == 1:
+                    _strip(item, subschemas[0], path + (str(i),), removed)
+                elif subschemas:
+                    _strip(item, {"anyOf": subschemas}, path + (str(i),), removed)
+
+
+def strip_unknown_fields(instance: t.Any, schema: dict) -> t.List[str]:
+    """Strip unknown fields from objects declared as closed (``additionalProperties:
+    false``) in the schema. The instance is updated in place.
+
+    ``allOf`` constraints are merged, ``oneOf``/``anyOf`` constraints are applied based
+    on the branches the instance can still match, and objects nested in arrays are
+    handled. Fields that are valid in any branch the instance can still match are never
+    stripped to force validation to pass.
+
+    :return: The dotted paths of the removed fields.
+    """
+    removed: t.List[str] = []
+    _strip(instance, schema, (), removed)
+    return removed

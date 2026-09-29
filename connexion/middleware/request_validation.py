@@ -133,6 +133,7 @@ class RequestValidationOperation:
                     ),
                     encoding=encoding,
                     strict_validation=self.strict_validation,
+                    unknown_fields=self._operation.unknown_fields_policy,
                     uri_parser=self._operation.uri_parser_class(
                         self._operation.parameters, self._operation.body_definition()
                     ),

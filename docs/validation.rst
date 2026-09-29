@@ -97,6 +97,70 @@ types (see :ref:`validation:Custom validators`).
 If ``requestBody`` validation fails, Connexion will return a ``400 Bad Request`` response with
 information on the failure in the description.
 
+Unknown fields
+""""""""""""""
+
+Older clients often send extra fields that are no longer (or not yet) part of your specification.
+By default, Connexion follows the JSON schema semantics: unknown fields are allowed on open
+objects, and rejected on objects declared as closed via ``additionalProperties: false``.
+
+You can change how unknown fields on closed objects are handled per operation with the
+``x-unknown-fields`` extension. It accepts one of three policies:
+
+- ``reject`` (default): the request is rejected with a ``400 Bad Request``, which is the
+  standard behavior.
+- ``strip``: unknown fields are removed from closed objects before validation. Your handler
+  function receives the same stripped data as was validated, while the original request body
+  is still logged by the validation middleware.
+- ``keep``: unknown fields are allowed and passed through to your handler function, even on
+  closed objects.
+
+.. code-block:: yaml
+    :caption: **openapi.yaml**
+
+    paths:
+      /users:
+        post:
+          operationId: myapp.users.create
+          x-unknown-fields: strip
+          requestBody:
+            content:
+              application/json:
+                schema:
+                  type: object
+                  additionalProperties: false
+                  properties:
+                    name:
+                      type: string
+
+The policy is applied based on the structure the request actually matches: ``allOf``
+constraints are merged, objects nested in arrays are handled, and for ``oneOf``/``anyOf``
+only the branches the request can still match are taken into account. Fields that are valid
+in such a branch are never stripped just to make validation pass.
+
+For example, given a ``oneOf`` with two closed branches:
+
+.. code-block:: yaml
+
+    oneOf:
+      - type: object
+        additionalProperties: false
+        required: [hunts]
+        properties: {name: {type: string}, hunts: {type: boolean}, lives: {type: integer}}
+      - type: object
+        additionalProperties: false
+        required: [barks]
+        properties: {name: {type: string}, barks: {type: boolean}, walks: {type: integer}}
+
+- ``{"name": "tom", "hunts": true, "lives": 9}`` matches the first branch and is kept
+  as is.
+- ``{"name": "tom", "hunts": true, "barks": true}`` mixes fields from both branches.
+  ``hunts`` is only valid in the first branch and ``barks`` only in the second, so neither
+  field is stripped to force a match. With ``strip`` (and ``reject``), the request is
+  rejected with a ``400 Bad Request`` because it is not valid under any of the given
+  schemas. With ``keep``, it is rejected as well, since it now matches both branches,
+  which violates ``oneOf``.
+
 For more information on how the ``requestBody`` is handled in general, see
 :ref:`request:Body`.
 

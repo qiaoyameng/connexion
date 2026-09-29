@@ -8,9 +8,12 @@ from starlette.types import Scope
 
 from connexion.exceptions import BadRequestProblem, NonConformingResponseBody
 from connexion.json_schema import (
+    UNKNOWN_FIELDS_POLICIES,
+    Draft4KeepUnknownFieldsValidator,
     Draft4RequestValidator,
     Draft4ResponseValidator,
     format_error_with_path,
+    strip_unknown_fields,
 )
 from connexion.validators import (
     AbstractRequestBodyValidator,
@@ -31,18 +34,33 @@ class JSONRequestBodyValidator(AbstractRequestBodyValidator):
         nullable=False,
         encoding: str,
         strict_validation: bool,
+        unknown_fields: str = "reject",
         **kwargs,
     ) -> None:
+        if unknown_fields not in UNKNOWN_FIELDS_POLICIES:
+            raise ValueError(
+                f"Invalid `unknown_fields` policy: {unknown_fields}. "
+                f"Should be one of {UNKNOWN_FIELDS_POLICIES}."
+            )
         super().__init__(
             schema=schema,
             required=required,
             nullable=nullable,
             encoding=encoding,
             strict_validation=strict_validation,
+            unknown_fields=unknown_fields,
         )
+        if unknown_fields == "strip":
+            # The stripped body should be passed to the application, so it sees the
+            # same data as was validated.
+            self.MUTABLE_VALIDATION = True
 
     @property
     def _validator(self):
+        if self._unknown_fields == "keep":
+            return Draft4KeepUnknownFieldsValidator(
+                self._schema, format_checker=Draft4Validator.FORMAT_CHECKER
+            )
         return Draft4RequestValidator(
             self._schema, format_checker=Draft4Validator.FORMAT_CHECKER
         )
@@ -64,6 +82,20 @@ class JSONRequestBodyValidator(AbstractRequestBodyValidator):
     def _validate(self, body: t.Any) -> t.Optional[dict]:
         if not self._nullable and body is None:
             raise BadRequestProblem("Request body must not be empty")
+        if self._unknown_fields == "strip" and body is not None:
+            logger.debug(
+                "Validating request body with `x-unknown-fields: strip`. "
+                "Original body: %s",
+                body,
+                extra={"validator": "body"},
+            )
+            removed = strip_unknown_fields(body, self._schema)
+            if removed:
+                logger.info(
+                    "Stripped unknown fields from request body: %s",
+                    ", ".join(removed),
+                    extra={"validator": "body"},
+                )
         try:
             return self._validator.validate(body)
         except ValidationError as exception:
@@ -85,7 +117,12 @@ class DefaultsJSONRequestBodyValidator(JSONRequestBodyValidator):
 
     @property
     def _validator(self):
-        validator_cls = self.extend_with_set_default(Draft4RequestValidator)
+        if self._unknown_fields == "keep":
+            validator_cls = self.extend_with_set_default(
+                Draft4KeepUnknownFieldsValidator
+            )
+        else:
+            validator_cls = self.extend_with_set_default(Draft4RequestValidator)
         return validator_cls(
             self._schema, format_checker=Draft4Validator.FORMAT_CHECKER
         )
